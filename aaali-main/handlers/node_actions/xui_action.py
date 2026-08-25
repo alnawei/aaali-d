@@ -72,16 +72,35 @@ def get_server_ip(instance_id: str) -> str:
 
 
 def get_server_password(instance_id: str) -> str:
-    """从本地数据库获取手动添加的服务器密码"""
+    """从本地数据库获取手动添加的服务器密码 (已完美修复表名与字段盲区)"""
+    # 🌟 修复 1：首选直接调用 db.py 中现成的专用方法提取密码
+    import db
     try:
-        db_path = getattr(config, 'DB_PATH', '/srv/aali/bot_data.db')
+        pwd = db.get_custom_server_password(instance_id)
+        if pwd:
+            return pwd.strip()
+    except Exception:
+        pass
+
+    # 🌟 修复 2：兼容性兜底逻辑，精准匹配表名与字段
+    import config
+    import sqlite3
+    try:
+        # 已经修正为你真实的数据库绝对路径 /srv/Ali/bot_data.db
+        db_path = getattr(config, 'DB_PATH', '/srv/Ali/bot_data.db')
         conn = sqlite3.connect(db_path, timeout=4.0)
         cursor = conn.cursor()
-        # 遍历可能存储服务器信息的表，寻找密码字段
-        for table in ["ecs_business", "servers", "ecs_instances", "instances"]:
+        
+        # 核心映射：custom_servers 用 root_password 字段，其他老表用 password
+        tables_map = {
+            "custom_servers": "root_password",
+            "ecs_business": "password",
+            "servers": "password"
+        }
+        
+        for table, col in tables_map.items():
             try:
-                # 尝试读取 password 字段
-                cursor.execute(f"SELECT password FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
+                cursor.execute(f"SELECT {col} FROM {table} WHERE instance_id = ? LIMIT 1", (instance_id,))
                 row = cursor.fetchone()
                 if row and row[0]:
                     conn.close()
@@ -89,8 +108,9 @@ def get_server_password(instance_id: str) -> str:
             except Exception:
                 continue
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"获取密码兜底逻辑报错: {e}")
+        
     return ""
 # async def fetch_command_output_async(client: EcsClient, region_id: str, invoke_id: str) -> str:
 #     req = ecs_models.DescribeInvocationResultsRequest(region_id=region_id, invoke_id=invoke_id)
@@ -531,7 +551,27 @@ conn.close()
     try: await call.answer("指令已开始在后台执行，请耐心等待...", show_alert=False)
     except Exception: pass
 
-    if action == "install": shell_script = """apt-get update -y && apt-get install -y curl wget sqlite3\nbash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'y\\nadmin\\nadmin\\n54321\\n' || true\n/usr/local/x-ui/x-ui setting -username admin -password admin -port 54321 || true\nsystemctl enable x-ui && systemctl restart x-ui\necho "INSTALL_XUI_SUCCESS" """
+    if action == "install": 
+        shell_script = """
+# 1. 强制补全本地网卡 (修复 Xray 死亡死循环占用 CPU)
+ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+ip link set lo up
+grep -q "iface lo inet loopback" /etc/network/interfaces || echo "auto lo\\niface lo inet loopback" >> /etc/network/interfaces
+
+# 2. 正常执行 3x-ui 面板安装
+apt-get update -y && apt-get install -y curl wget sqlite3
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'y\\nadmin\\nadmin\\n54321\\n' || true
+/usr/local/x-ui/x-ui setting -username admin -password admin -port 54321 || true
+
+# 3. 强制回退激进的 TCP 优化参数 (拯救 MTProto 断流问题)
+sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
+echo 'net.ipv4.tcp_tw_reuse = 0' >> /etc/sysctl.conf
+sysctl -p >/dev/null 2>&1
+
+# 4. 重启应用
+systemctl enable x-ui && systemctl restart x-ui
+echo "INSTALL_XUI_SUCCESS"
+"""
     elif action == "update": shell_script = "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< $'n\\n' && systemctl restart x-ui"
     elif action == "start": shell_script = "systemctl start x-ui && systemctl restart x-ui && echo 'SUCCESS'"
     elif action == "stop": shell_script = "systemctl stop x-ui && echo 'SUCCESS'"
@@ -657,3 +697,4 @@ print('ROUTE_OK')
         await wait_msg.edit_text("❌ <b>配置失败：</b>\n底层通信严重超时，未能确认路由注入结果。", reply_markup=port_kb, parse_mode="HTML")
     except Exception as e:
         await wait_msg.edit_text(f"❌ <b>路由注入失败：</b>\n{str(e)}", reply_markup=port_kb, parse_mode="HTML")
+
